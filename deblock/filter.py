@@ -19,9 +19,6 @@ Shared contract
   ``(q0, q1, q2, q3)``; ``p0`` and ``q0`` are the samples adjacent to the
   boundary.  The same ordering is used by :func:`boundary_strength`,
   :func:`filter_luma` and :func:`filter_edge`.
-
-The stubs below define the contracts only.  All eight functions raise
-``NotImplementedError`` until implemented.
 """
 
 from __future__ import annotations
@@ -39,6 +36,38 @@ __all__ = [
 
 Frame = list[list[int]]
 QPMap = list[list[int]]
+
+# H.264 Table 8-16 luma alpha / beta threshold tables, indexed by the
+# clamped table index (QP + offset, 0..51).  These are exact lookups: there
+# is no interpolation between neighbouring QP rows.
+_ALPHA_TABLE = (
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    4, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 17, 20, 22, 25, 28,
+    32, 36, 40, 45, 50, 56, 63, 71, 80, 90, 101, 113, 127, 144,
+    162, 182, 203, 226, 255, 255, 255,
+)
+_BETA_TABLE = (
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 6, 6,
+    7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+    14, 14, 15, 15, 16, 16, 17,
+)
+
+# H.264 Table 8-17 luma tC0 table, indexed by the clamped table index.
+_TC0_TABLE = (
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+    2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5,
+    5, 5, 6, 6, 6, 6,
+)
+
+
+def _clamp(value: int, low: int, high: int) -> int:
+    if value < low:
+        return low
+    if value > high:
+        return high
+    return value
 
 
 def boundary_strength(
@@ -63,7 +92,19 @@ def boundary_strength(
     and a low-QP flat area must not be promoted to a filterable edge.  ``bS``
     is always in ``0..4``; results are integers.
     """
-    raise NotImplementedError("boundary_strength")
+    if intra:
+        return 4
+
+    alpha, beta, _ = thresholds(qp, 0)
+    d = max(abs(int(p[i]) - int(q[i])) for i in range(4))
+
+    if d <= 1:
+        return 0
+    if d < beta:
+        return 1
+    if d < alpha:
+        return 2
+    return 3
 
 
 def thresholds(qp: int, offset: int = 0) -> tuple[int, int, int]:
@@ -78,7 +119,8 @@ def thresholds(qp: int, offset: int = 0) -> tuple[int, int, int]:
     ``alpha``, ``beta`` and ``tC0`` are non-negative integers, and the three
     returned thresholds are non-decreasing with the table index.
     """
-    raise NotImplementedError("thresholds")
+    index = _clamp(int(qp) + int(offset), 0, 51)
+    return _ALPHA_TABLE[index], _BETA_TABLE[index], _TC0_TABLE[index]
 
 
 def filter_luma(
@@ -104,7 +146,49 @@ def filter_luma(
     All returned samples are 8-bit integers in ``[0, 255]``.  The result is
     compared with an absolute tolerance of ``0.5`` pixel.
     """
-    raise NotImplementedError("filter_luma")
+    p3, p2, p1, p0 = (int(v) for v in p)
+    q0, q1, q2, q3 = (int(v) for v in q)
+
+    # No edge, or a zero/negative tC0: the edge is not touched.
+    if bS == 0 or tc <= 0:
+        return (p3, p2, p1, p0), (q0, q1, q2, q3)
+
+    if bS == 4:
+        # H.264 8.7.5.3.3 strong-filter averages.  Each output is then
+        # clamped to the local five-sample neighbourhood so a remote p3/q3
+        # outlier cannot cause overshoot.
+        local_low = min(p2, p1, p0, q0, q1)
+        local_high = max(p2, p1, p0, q0, q1)
+
+        def neighbourhood_clamp(value: int) -> int:
+            return _clamp(value, local_low, local_high)
+
+        new_p1 = neighbourhood_clamp(
+            (p2 + p1 + p0 + q0 + 2) >> 2
+        )
+        new_p0 = neighbourhood_clamp(
+            (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3
+        )
+        new_q0 = neighbourhood_clamp(
+            (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3
+        )
+        new_q1 = neighbourhood_clamp(
+            (p0 + q0 + q1 + q2 + 2) >> 2
+        )
+        return (
+            (p3, p2, new_p1, new_p0),
+            (new_q0, new_q1, q2, q3),
+        )
+
+    # 1 <= bS <= 3: weak branch.  Only the two boundary samples move, and
+    # the movement is clipped to [-tc, tc] using tC0, never beta.  The raw
+    # delta is the H.264 8.7.5.3.2 weak-filter delta; Python's >> on signed
+    # integers is an arithmetic (sign-extending) shift, matching the spec.
+    delta_raw = (((q0 - p0) << 2) + (p1 - q1) + 4) >> 3
+    delta = _clamp(delta_raw, -tc, tc)
+    new_p0 = _clamp(p0 + delta, 0, 255)
+    new_q0 = _clamp(q0 - delta, 0, 255)
+    return (p3, p2, p1, new_p0), (new_q0, q1, q2, q3)
 
 
 def filter_edge(
@@ -134,7 +218,55 @@ def filter_edge(
     The original frame is rectangular and the whole four-pixel segment must be
     in range; otherwise ``ValueError`` is raised.
     """
-    raise NotImplementedError("filter_edge")
+    height = len(frame)
+    width = len(frame[0]) if height else 0
+
+    if vertical:
+        in_range = (
+            0 <= y and y + 3 < height
+            and 0 <= x - 4 and x + 3 < width
+        )
+    else:
+        in_range = (
+            0 <= x and x + 3 < width
+            and 0 <= y - 4 and y + 3 < height
+        )
+    if not in_range:
+        raise ValueError(
+            "edge segment is out of range for the frame"
+        )
+
+    _, _, tc0 = thresholds(qp, 0)
+
+    # Work on a full snapshot copy: every read below comes from the original
+    # input, so writing q-side samples can never contaminate a p-side read.
+    out = [list(row) for row in frame]
+
+    for k in range(4):
+        if vertical:
+            row = y + k
+            p = tuple(frame[row][x - 4 + i] for i in range(4))
+            q = tuple(frame[row][x + i] for i in range(4))
+        else:
+            col = x + k
+            p = tuple(frame[y - 4 + i][col] for i in range(4))
+            q = tuple(frame[y + i][col] for i in range(4))
+
+        bS = boundary_strength(p, q, qp, intra=False)
+        new_p, new_q = filter_luma(p, q, bS, tc0)
+
+        if vertical:
+            row = y + k
+            for i in range(4):
+                out[row][x - 4 + i] = new_p[i]
+                out[row][x + i] = new_q[i]
+        else:
+            col = x + k
+            for i in range(4):
+                out[y - 4 + i][col] = new_p[i]
+                out[y + i][col] = new_q[i]
+
+    return out
 
 
 def filter_frame(frame: Frame, qp_map: QPMap, block: int) -> list[list[int]]:
@@ -160,7 +292,57 @@ def filter_frame(frame: Frame, qp_map: QPMap, block: int) -> list[list[int]]:
     input raises ``ValueError`` with the messages from
     :func:`validate_frame`.
     """
-    raise NotImplementedError("filter_frame")
+    errors = validate_frame(frame, qp_map, block)
+    if errors:
+        raise ValueError("; ".join(errors))
+
+    height = len(frame)
+    width = len(frame[0])
+
+    # Every candidate segment is filtered independently from the same input
+    # snapshot.  Their outputs are merged afterwards, so no pixel is ever
+    # filtered twice (no chained vertical-then-horizontal application).
+    candidates: list[tuple[int, int, bool, Frame]] = []
+
+    for bx in range(block, width, block):
+        for y in range(0, height, 4):
+            segment = filter_edge(frame, bx, y, True, qp_map[y][bx])
+            candidates.append((bx, y, True, segment))
+
+    for by in range(block, height, block):
+        for x in range(0, width, 4):
+            segment = filter_edge(frame, x, by, False, qp_map[by][x])
+            candidates.append((x, by, False, segment))
+
+    result = [list(row) for row in frame]
+    # owner[y][x] = (distance, vertical_priority) of the currently winning
+    # candidate for that pixel; ties resolve in favour of the vertical edge.
+    owner: list[list[tuple[int, int] | None]] = [
+        [None] * width for _ in range(height)
+    ]
+
+    for boundary_x, start_y, vertical, segment in candidates:
+        if vertical:
+            for row in range(start_y, start_y + 4):
+                for col in range(boundary_x - 4, boundary_x + 4):
+                    distance = abs(col - boundary_x)
+                    key = (distance, 0)  # 0: vertical wins a tie
+                    current = owner[row][col]
+                    if current is None or key < current:
+                        owner[row][col] = key
+                        result[row][col] = segment[row][col]
+        else:
+            boundary_y = start_y
+            for row in range(boundary_y - 4, boundary_y + 4):
+                for col in range(boundary_x, boundary_x + 4):
+                    distance = abs(row - boundary_y)
+                    key = (distance, 1)  # 1: horizontal loses a tie
+                    current = owner[row][col]
+                    if current is None or key < current:
+                        owner[row][col] = key
+                        result[row][col] = segment[row][col]
+
+    return result
 
 
 def edge_map(frame: Frame, block: int) -> list[list[int]]:
@@ -176,7 +358,17 @@ def edge_map(frame: Frame, block: int) -> list[list[int]]:
     an entry.  A strong image edge that is not block-aligned is not a block
     boundary.
     """
-    raise NotImplementedError("edge_map")
+    height = len(frame)
+    width = len(frame[0]) if height else 0
+    return [
+        [
+            1 if (0 < x < width and x % block == 0)
+            or (0 < y < height and y % block == 0)
+            else 0
+            for x in range(width)
+        ]
+        for y in range(height)
+    ]
 
 
 def validate_frame(frame: Frame, qp_map: QPMap, block: int) -> list[str]:
@@ -193,7 +385,57 @@ def validate_frame(frame: Frame, qp_map: QPMap, block: int) -> list[str]:
 
     Repeated or multiple independent failures may produce several strings.
     """
-    raise NotImplementedError("validate_frame")
+    errors: list[str] = []
+
+    if not frame or not isinstance(frame, list) or any(
+        not isinstance(row, list) for row in frame
+    ):
+        errors.append("frame must be a non-empty rectangular list of rows")
+        return errors
+
+    height = len(frame)
+    width = len(frame[0])
+
+    if width == 0 or any(len(row) != width for row in frame):
+        errors.append("frame must be a non-empty rectangular list of rows")
+
+    for y, row in enumerate(frame):
+        for x, value in enumerate(row):
+            if not isinstance(value, int) or value < 0 or value > 255:
+                errors.append(
+                    f"frame pixel at (x={x}, y={y}) must be in [0, 255]"
+                )
+
+    if (
+        not isinstance(qp_map, list)
+        or len(qp_map) != height
+        or any(not isinstance(row, list) or len(row) != width for row in qp_map)
+    ):
+        errors.append("qp_map must have exactly the frame shape")
+    else:
+        for y, row in enumerate(qp_map):
+            for x, value in enumerate(row):
+                if not isinstance(value, int) or value < 0 or value > 51:
+                    errors.append(
+                        f"qp_map value at (x={x}, y={y}) must be in [0, 51]"
+                    )
+
+    if not isinstance(block, int) or block <= 0 or block % 4 != 0:
+        errors.append("block must be a positive multiple of four")
+
+    # The divisibility check is independent of the multiple-of-four check so
+    # that a non-conforming block is still reported as not dividing the frame.
+    if isinstance(block, int) and block > 0:
+        if width % block != 0:
+            errors.append(
+                f"block {block} must divide frame width {width}"
+            )
+        if height % block != 0:
+            errors.append(
+                f"block {block} must divide frame height {height}"
+            )
+
+    return errors
 
 
 def deblock_batch(frames: list[Frame], config: dict) -> dict:
@@ -216,4 +458,31 @@ def deblock_batch(frames: list[Frame], config: dict) -> dict:
     invalid frame/QP map raises ``ValueError`` before any result is returned;
     the input frames are never mutated.
     """
-    raise NotImplementedError("deblock_batch")
+    block = config["block"]
+    qp_maps = config["qp_maps"]
+
+    if len(frames) != len(qp_maps):
+        raise ValueError(
+            "qp_maps must contain exactly one qp map per frame"
+        )
+
+    # Validate every job up front so a bad later frame cannot surface after
+    # partial results have been produced.
+    for index, (frame, qp_map) in enumerate(zip(frames, qp_maps)):
+        errors = validate_frame(frame, qp_map, block)
+        if errors:
+            raise ValueError(f"frame {index}: " + "; ".join(errors))
+
+    filtered_frames: list[Frame] = []
+    maps: list[list[list[int]]] = []
+    # Each frame uses its own QP map and gets fresh buffers; nothing mutable
+    # is carried over from one frame to the next.
+    for frame, qp_map in zip(frames, qp_maps):
+        filtered_frames.append(filter_frame(frame, qp_map, block))
+        maps.append(edge_map(frame, block))
+
+    return {
+        "frames": filtered_frames,
+        "edge_maps": maps,
+        "count": len(frames),
+    }
